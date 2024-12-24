@@ -46,6 +46,10 @@ void *inet6_rth_init (void *bp, socklen_t bp_len, int type, int segments);
 int inet6_rth_add (void *bp, const struct in6_addr *addr);
 #endif
 
+#if (defined(__FreeBSD__) || defined(__MACH__)) && !defined(s6_addr32)
+# define s6_addr32 __u6_addr.__u6_addr32
+#endif
+
 #ifndef IPV6_RTHDR_TYPE_0
 # define IPV6_RTHDR_TYPE_0 0
 #endif
