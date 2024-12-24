@@ -58,6 +58,8 @@
 #include <netinet/in.h>
 #include <netinet/icmp6.h>
 
+#include <assert.h>
+
 #ifndef IPV6_RECVHOPLIMIT
 /* Using obsolete RFC 2292 instead of RFC 3542 */ 
 # define IPV6_RECVHOPLIMIT IPV6_HOPLIMIT
@@ -84,6 +86,7 @@ enum ndisc_flags
 	NDISC_NUMERIC   =0x4,
 	NDISC_SINGLE    =0x8,
 	NDISC_NO_SOLICIT=0x10,
+	NDISC_KEEP      =0x20,
 };
 
 
@@ -159,6 +162,7 @@ printmacaddress (const uint8_t *ptr, size_t len)
 		printf ("%02X\n", *ptr);
 }
 
+static int last_timer = -1;
 
 #ifndef RDISC
 # ifdef __linux__
@@ -569,6 +573,7 @@ parseadv (const uint8_t *buf, size_t len, const struct sockaddr_in6 *tgt,
 		v = ntohs (ra->nd_ra_router_lifetime);
 		printf (_("%12u (0x%08x) %s\n"), v, v,
 		        ngettext ("second", "seconds", v));
+		last_timer = v;
 
 		/* ND Reachable time */
 		fputs (_("Reachable time            : "), stdout);
@@ -783,11 +788,20 @@ recvadv (int fd, const struct sockaddr_in6 *tgt, unsigned wait_ms,
 	return -1; /* error */
 }
 
+#define RFC7559_IRT ((int) 4)    /* RFC7559, Initial Retransmission Time, in seconds */
+#define RFC7559_MRT ((int) 3600) /* RFC7559, Maximum Retransmission Time, in seconds */
+
+static inline int
+clamp (int var, int cvar, int fvar)
+{
+	assert(cvar < fvar);
+	return (var <= fvar) ? ((var >= cvar) ? var : cvar) : fvar;
+}
 
 static int fd;
 
 static int
-ndisc (const char *name, const char *ifname, unsigned flags, unsigned retry,
+ndisc (const char *name, const char *ifname, unsigned flags, const unsigned retry,
        unsigned wait_ms, const char *source)
 {
 	struct sockaddr_in6 tgt;
@@ -832,6 +846,7 @@ ndisc (const char *name, const char *ifname, unsigned flags, unsigned retry,
 			printf (_("Soliciting %s (%s) on %s...\n"), name, s, ifname);
 	}
 
+	do
 	{
 		solicit_packet packet;
 		struct sockaddr_in6 dst;
@@ -842,7 +857,21 @@ ndisc (const char *name, const char *ifname, unsigned flags, unsigned retry,
 		if (plen == -1)
 			goto error;
 
-		while (retry > 0)
+		if(last_timer != -1)
+		{
+			int exptime = clamp(last_timer - RFC7559_IRT, RFC7559_IRT, RFC7559_MRT);
+			if(flags & NDISC_VERBOSE)
+			{
+				printf( _("Schedule next solicitation at %d seconds\n"), exptime);
+			}
+			fflush(stdout);
+			sleep(exptime);
+		}
+
+		last_timer = -1;
+		__auto_type curr_retry = retry; 
+
+		while (curr_retry > 0)
 		{
 			/* sends a Solitication */
 			if (!(flags & NDISC_NO_SOLICIT)
@@ -853,33 +882,35 @@ ndisc (const char *name, const char *ifname, unsigned flags, unsigned retry,
 				perror (_("Sending ICMPv6 packet"));
 				goto error;
 			}
-			retry--;
+			curr_retry--;
 	
 			/* receives an Advertisement */
 			ssize_t val = recvadv (fd, &tgt, wait_ms, flags);
 			if (val > 0)
 			{
-				close (fd);
-				return 0;
+				break;
 			}
 			else
 			if (val == 0)
 			{
 				if (flags & NDISC_VERBOSE)
+				{
 					puts (_("Timed out."));
+				}
 			}
 			else
 				goto error;
 		}
-	}
+	} while(last_timer != -1 && flags & NDISC_KEEP);
 
-	close (fd);
+	if(last_timer != -1)
+		return 0;
+
 	if (flags & NDISC_VERBOSE)
 		puts (_("No response."));
 	return -2;
 
 error:
-	close (fd);
 	return -1;
 }
 
@@ -909,6 +940,9 @@ usage (const char *path)
 "  -V, --version    display program version and exit\n"
 "  -v, --verbose    verbose display (this is the default)\n"
 "  -w, --wait       how long to wait for a response [ms] (default: 1000)\n"
+#ifdef RDISC
+"  -k, --keep       keep sending when RA is about expired, omit -1.\n"
+#endif
 	           "\n"), gettext (ndisc_dataname));
 
 	return 0;
@@ -932,6 +966,11 @@ version (void)
 	return 0;
 }
 
+#ifdef RDISC
+# define RDISC_KEEPSEND "k"
+#else
+# define RDISC_KEEPSEND 
+#endif
 
 static const struct option opts[] = 
 {
@@ -946,6 +985,9 @@ static const struct option opts[] =
 	{ "version",    no_argument,       NULL, 'V' },
 	{ "verbose",    no_argument,       NULL, 'v' },
 	{ "wait",       required_argument, NULL, 'w' },
+#ifdef RDISC
+	{ "keep",no_argument,       NULL, 'k' },
+#endif
 	{ NULL,         0,                 NULL, 0   }
 };
 
@@ -969,7 +1011,7 @@ main (int argc, char *argv[])
 	unsigned retry = 3, flags = ndisc_default, wait_ms = nd_delay_ms;
 	const char *hostname, *ifname, *source = NULL;
 
-	while ((val = getopt_long (argc, argv, "1dhmnqr:s:Vvw:", opts, NULL)) != EOF)
+	while ((val = getopt_long (argc, argv, "1dhmnqr:s:Vvw:" RDISC_KEEPSEND , opts, NULL)) != EOF)
 	{
 		switch (val)
 		{
@@ -1033,6 +1075,11 @@ main (int argc, char *argv[])
 				break;
 			}
 
+			case 'k':
+				flags |= NDISC_KEEP;
+				flags |= NDISC_SINGLE;
+				break;
+
 			case '?':
 			default:
 				return quick_usage (argv[0]);
@@ -1063,6 +1110,8 @@ main (int argc, char *argv[])
 		return quick_usage (argv[0]);
 
 	errno = errval; /* restore socket() error value */
-	return -ndisc (hostname, ifname, flags, retry, wait_ms, source);
+	int ndisc_retval = -ndisc (hostname, ifname, flags, retry, wait_ms, source);
+	close(fd);
+	return ndisc_retval;
 }
 
